@@ -183,7 +183,7 @@ class MaskGit(nn.Module):
             x = rearrange(x, 'b ... -> b (...)')
 
         b, n, device = *x.shape, x.device
-        print ("X INPUT ", x.size())
+
         if not exists(text_mask):
             text_mask = torch.ones((b, n), device = device, dtype = torch.bool)
 
@@ -192,7 +192,6 @@ class MaskGit(nn.Module):
         rel_pos_bias = self.continuous_pos_bias(*video_patch_shape, device = device)
 
         if cond_drop_prob > 0:
-            print ("CONDITION DROP PROB", cond_drop_prob)
             keep_mask = prob_mask_like((b,), 1 - cond_drop_prob, device = device)
             text_mask = rearrange(keep_mask, 'b -> b 1') & text_mask
 
@@ -210,7 +209,7 @@ class MaskGit(nn.Module):
             video_shape = video_shape,
             attn_bias = rel_pos_bias,
             self_attn_mask = video_mask,
-            cross_attn_context_mask = None,
+            cross_attn_context_mask = text_mask,
             **kwargs
         )
 
@@ -408,7 +407,21 @@ class Phenaki(nn.Module):
         self.cond_drop_prob = cond_drop_prob # classifier free guidance for transformers - @crowsonkb
 
         ###### EKG ENCODER ######
-        config_path='/STMEM/configs/downstream/st_mem.yaml'
+        
+        # from huggingface_hub import hf_hub_download
+        
+        # _ = hf_hub_download(
+        #     repo_id='wanglab/ecg-fm-preprint',
+        #     filename='mimic_iv_ecg_physionet_pretrained.pt',
+        #     local_dir='EchoPulse_pytorch/frozen_models/ecg_fm/',
+        # )
+        # _ = hf_hub_download(
+        #     repo_id='wanglab/ecg-fm-preprint',
+        #     filename='mimic_iv_ecg_physionet_pretrained.yaml',
+        #     local_dir='EchoPulse_pytorch/frozen_models/ecg_fm/',
+        # )
+        
+        config_path='EchoPulse_pytorch/STMEM/configs/downstream/st_mem.yaml'
         
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
@@ -438,6 +451,7 @@ class Phenaki(nn.Module):
             for _, p in model.head.named_parameters():
                 p.requires_grad = True
                 
+        model = model.eval()
         self.encode_ekg = model
         print("ST_MEM Encoder loaded and frozen successfully.")
         ###### EKG ENCODER ######
@@ -494,8 +508,6 @@ class Phenaki(nn.Module):
 
             prime_token_length = prime_token_ids.shape[-1]
             prime_num_frames = prime_frames.shape[2]
-            
-            print ("CHCK ", prime_num_frames)
 
         num_tokens = self.cvivit.num_tokens_per_frames(num_frames, include_first_frame = not exists(prime_frames))
 
@@ -504,9 +516,11 @@ class Phenaki(nn.Module):
         text_embeds = text_mask = None
 
         # if exists(ekg):
-        print ("EXIST ekg" *10, ekg.size())
+        # print ("EXIST ekg" *10, ekg.size())
+        
         with torch.no_grad():
             ekg_embeds = self.encode_ekg(ekg).unsqueeze(axis=1) # original text embedding 1 #voca + 1 768
+            
         ekg_mask = torch.any(ekg_embeds != 0, dim = -1)
         batch_size = len(ekg_embeds)
 
@@ -543,7 +557,7 @@ class Phenaki(nn.Module):
                 input_token_ids,
                 video_patch_shape = patch_shape,
                 context = ekg_embeds,
-                text_mask = None,
+                text_mask = ekg_mask,
                 cond_scale = cond_scale
             )
 
@@ -560,7 +574,7 @@ class Phenaki(nn.Module):
                     critic_kwargs = dict(
                         video_patch_shape = patch_shape,
                         context = ekg_embeds,
-                        text_mask = None,
+                        text_mask = ekg_mask,
                         cond_scale = cond_scale
                     )
 
@@ -621,12 +635,10 @@ class Phenaki(nn.Module):
         only_train_critic = False
     ):
         
-        print ("PHENAKI FORWAR D" , ekg.size())
-        
-        assert not (only_train_generator  and only_train_critic)
+        assert not (only_train_generator and only_train_critic)
         assert exists(videos) ^ exists(video_codebook_ids), 'either raw video or '
         assert not (exists(videos) and not exists(self.cvivit)), 'cvivit must be provided if one wants to encode the videos live during training'
-        # print(ekg)
+
         # assert (exists(text_embeds) ^ exists(texts)) ^ self.unconditional, 'either raw text of text embeds must be given, and if unconditional, none should be given'
 
         assert not (exists(text_embeds) and text_embeds.shape[-1] != self.text_embed_dim), 'text embedding dimension is not correct'
@@ -652,17 +664,13 @@ class Phenaki(nn.Module):
             with torch.no_grad():
                 self.cvivit.eval()
                 video_codebook_ids = self.cvivit(videos, return_only_codebook_ids = True)
-                print ("video_codebook_ids VQVQE encoder ", video_codebook_ids.size())
-        # derive text embeddings, mask, conditional dropout
-        # print ("video_codebook_ids VQVQE encoder ", video_codebook_ids, video_codebook_ids.size())
+                
         text_mask = None    
         cond_drop_prob = 0
-                
-        print ('self.unconditional ', self.unconditional)
-        if not self.unconditional:
-            with torch.no_grad():
-                ekg_embeds = self.encode_ekg(ekg).unsqueeze(axis=1) # original text embedding 1 #voca + 1 768
-                print ("ekg_embeds", ekg_embeds.size()) # b 48 768 #[50, 1, 768]
+
+        with torch.no_grad():
+            ekg_embeds = self.encode_ekg(ekg).unsqueeze(axis=1) # original text embedding 1 #voca + 1 768
+            
         ekg_mask = torch.any(ekg_embeds != 0, dim = -1) # save the researcher from having to think about mask, by assuming if all of the feature dimension is 0, it is masked out
 
         cond_drop_prob = default(cond_drop_prob, self.cond_drop_prob)
@@ -688,7 +696,8 @@ class Phenaki(nn.Module):
         
         # mask_token_prob = torch.cos(rand_step * math.pi * 0.5) # cosine schedule was best
         
-        print("mask_token_prob---------------:"+str(mask_token_prob))
+        # print("mask_token_prob---------------:"+str(mask_token_prob))
+        
         if not exists(video_mask):
             video_mask = torch.ones((batch, seq), device = device).bool()
         
@@ -702,7 +711,6 @@ class Phenaki(nn.Module):
 
         if not self.unconditional:
             with maskgit_forward_context():
-                print(cond_drop_prob)
                 logits = self.maskgit(
                     masked_input,
                     video_mask = video_mask,
@@ -710,7 +718,6 @@ class Phenaki(nn.Module):
                     text_mask = ekg_mask,   ## Try mask
                     context = ekg_embeds
                 )
-            print ('MASKGIT'*10)
         else:
             with maskgit_forward_context():
                 logits = self.maskgit(
@@ -729,6 +736,41 @@ class Phenaki(nn.Module):
 
         if not exists(self.critic) or only_train_generator:
             return loss
+        
+        # sample the predicted masked tokens
+
+        pred_video_ids = gumbel_sample(logits, temperature = self.critic_train_sample_temperature)
+
+        # derive critic input
+
+        critic_input = torch.where(mask_token_mask, pred_video_ids, video_codebook_ids)
+
+        # critic may or may not need text conditioning
+
+        critic_input, = unpack(critic_input, packed_shape, 'b *')
+
+        pred_fake_or_real_logits = self.critic(
+            critic_input,
+            video_mask = video_mask,
+            cond_drop_prob = cond_drop_prob,
+            text_mask = ekg_mask,
+            context = ekg_embeds
+        )
+
+        critic_labels = (video_codebook_ids != pred_video_ids).float()
+
+        critic_loss = F.binary_cross_entropy_with_logits(
+            pred_fake_or_real_logits,
+            critic_labels
+        )
+
+        critic_loss_weight = self.critic_loss_weight
+
+        if only_train_critic:
+            loss = 0
+            critic_loss_weight = 1.
+
+        return loss + critic_loss * critic_loss_weight
 
 @beartype
 def make_video(

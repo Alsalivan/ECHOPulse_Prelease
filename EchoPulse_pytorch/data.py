@@ -2,6 +2,7 @@ from pathlib import Path
 import re
 
 import cv2
+import os
 from PIL import Image
 from functools import partial
 
@@ -11,11 +12,13 @@ from beartype.door import is_bearable
 import numpy as np
 
 import torch
+import random
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader as PytorchDataLoader
 from torchvision import transforms as T, utils
 
 from einops import rearrange
+from scipy.signal import resample
 
 # helper functions
 
@@ -33,8 +36,15 @@ def pair(val):
 
 
 def bgr_to_rgb(video_tensor):
-    video_tensor = video_tensor[[2, 1, 0], :, :, :]
-    return video_tensor
+    if video_tensor.shape[0] == 1:
+        # Grayscale image: no need to reorder channels
+        return video_tensor
+    elif video_tensor.shape[0] == 3:
+        # Color image: swap BGR -> RGB
+        return video_tensor[[2, 1, 0], :, :, :]
+    else:
+        raise ValueError(f"Unsupported number of channels: {video_tensor.shape[0]}")
+
 
 
 def cast_num_frames(t, *, frames):
@@ -329,6 +339,101 @@ def collate_tensors_and_strings(data):
 
     return tuple(output)
 
+def collate_tensors_and_ecgs(batch):
+    cmrs, ekgs = zip(*batch)  # tuple of tensors
+
+    # Stack CMR tensors
+    cmrs = torch.stack(cmrs, dim=0)  # [batch_size, 1, T, H, W]
+
+    # Stack ECG tensors
+    ekgs = torch.stack(ekgs, dim=0)  # [batch_size, 12, 2500]
+
+    return cmrs, ekgs
 
 def DataLoader(*args, **kwargs):
-    return PytorchDataLoader(*args, collate_fn=collate_tensors_and_strings, **kwargs)
+    return PytorchDataLoader(*args, collate_fn=collate_tensors_and_ecgs, **kwargs)
+
+
+class VideoDatasetCMR(Dataset):
+    """
+    Dataset class used to load CMR image sequence from UKBiobank data
+    """
+    def __init__(
+        self,
+        image_size: int,
+        mode: str,
+        folder: str
+    ):
+        self.data_imaging = np.load(os.path.join(folder, f"image_data_{mode}.npy"), mmap_mode='c')
+        
+        self.transforms = T.Compose([
+            T.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
+            # T.ColorJitter(brightness=0.2, contrast=0.2),
+            T.RandomHorizontalFlip(p=0.5),
+            T.RandomRotation(degrees=10),
+            # T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+        ])
+
+    def __len__(self):
+        return len(self.data_imaging)
+
+    def __getitem__(self, index: int) -> torch.Tensor:
+        video = torch.from_numpy(self.data_imaging[index][::2])  # [T, H, W]
+        video = video.unsqueeze(1)  # [T, 1, H, W]
+        video = self.transforms(video)  # [T, 1, H, W]
+        video = video.permute(1, 0, 2, 3)  # [C, T, H, W]
+        
+        return video
+    
+
+class MultiModalDatasetCMRECG(Dataset):
+    """
+    Dataset class used to load CMR image sequence and ECG signal from UKBiobank data
+    """
+    def __init__(
+        self,
+        mode: str,
+        image_size: int,
+        folder_cmr: str,
+        folder_ecg: str,
+    ):
+        self.ecg_crop_size = 2250
+        self.ecg_input_fs = 500
+        self.ecg_target_fs = 250
+        self.resample_ratio = self.ecg_target_fs / self.ecg_input_fs  # 0.5
+        
+        self.data_imaging = np.load(os.path.join(folder_cmr, f"image_data_{mode}.npy"), mmap_mode='c')
+        self.data_ecg = np.load(os.path.join(folder_ecg, f"{mode}_new_ecg_data.npy"), mmap_mode='c')
+        
+        self.image_transforms = T.Compose([
+            # T.RandomResizedCrop(image_size, scale=(0.8, 1.0)),
+            # T.ColorJitter(brightness=0.2, contrast=0.2),
+            T.RandomHorizontalFlip(p=0.5),
+            # T.RandomRotation(degrees=10),
+            # T.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+        ])
+            
+    def __len__(self):
+        return len(self.data_imaging)
+    
+    def __getitem__(self, index: int):
+        # --- CMR ---
+        video = torch.from_numpy(self.data_imaging[index][::2])  # [T, H, W]
+        video = video.unsqueeze(1)  # [T, 1, H, W]
+        video = self.image_transforms(video)
+        cmr = video.permute(1, 0, 2, 3)  # [C, T, H, W]
+
+        # --- ECG ---
+        ecg = self.data_ecg[index]  # shape [12, 5000]
+
+        # Resample to 250 Hz → shape [12, 2500]
+        ecg_resampled = resample(ecg, int(ecg.shape[-1] * self.resample_ratio), axis=-1)
+
+        # Crop 2250 samples
+        start = random.randint(0, ecg_resampled.shape[-1] - self.ecg_crop_size)
+        ecg_cropped = ecg_resampled[:, start:start + self.ecg_crop_size]
+
+        ecg_tensor = torch.from_numpy(ecg_cropped).float()  # [12, 2250]
+
+        return cmr, ecg_tensor
+    
