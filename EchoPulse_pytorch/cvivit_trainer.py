@@ -203,7 +203,7 @@ class CViViTTrainer(nn.Module):
         
         if exists(vae.discr):
             discr_parameters = list(vae.discr.parameters())
-            self.discr_optim = get_optimizer(discr_parameters, lr=5e-5, wd=1e-4)
+            self.discr_optim = get_optimizer(discr_parameters, lr=1e-6, wd=1e-4)
         else:
             self.discr_optim = None
 
@@ -296,28 +296,6 @@ class CViViTTrainer(nn.Module):
             del state_dict['step']
         
         self.vae.load_state_dict(state_dict)
-        
-    @classmethod
-    def from_pretrained(cls, model_dir, for_eval=True):
-        model_dir = Path(model_dir)
-        config_path = model_dir / "config.json"
-        weights_path = model_dir / "pytorch_model.bin"
-
-        # Load config
-        assert config_path.exists(), f"Missing config at {config_path}"
-        with open(config_path, 'r') as f:
-            config = json.load(f)
-
-        # Reconstruct model with loaded config
-        model = cls(**config)
-
-        model.load_state_dict(torch.load(weights_path, map_location='cpu'))
-
-        # Optional: strip off VGG, I3D, Discriminator if just evaluating
-        if for_eval:
-            model = model.copy_for_eval()
-
-        return model
     
     def print(self, msg):
         self.accelerator.print(msg)
@@ -375,7 +353,7 @@ class CViViTTrainer(nn.Module):
         self.scheduler_optim.step(self.steps + self.scheduler_optim_overhead)
         accum_log(logs, {'lr': self.optim.param_groups[0]["lr"]})
         
-        if exists(self.discr_optim) and self.steps.item() > 30000:
+        if exists(self.discr_optim) and self.steps.item() >= 0:
             self.discr_optim.zero_grad()
 
             for _ in range(self.grad_accum_every):
