@@ -12,6 +12,7 @@ from torch import nn, einsum
 from torch.autograd import grad as torch_grad
 
 import torchvision
+import json
 
 from torch.autograd import Variable
 from EchoPulse_pytorch.frozen_models.pytorch_i3d.pytorch_i3d import InceptionI3d
@@ -142,13 +143,6 @@ def log_wandb_all_losses(accelerator, commit_loss, gen_loss, perceptual_loss, i3
 
 # discriminator
 
-def center_crop_64(x):
-    _, _, h, w = x.shape
-    start_h = (h - 64) // 2
-    start_w = (w - 64) // 2
-    return x[:, :, start_h:start_h + 64, start_w:start_w + 64]
-
-
 class DiscriminatorBlock(nn.Module):
     def __init__(
         self,
@@ -197,7 +191,7 @@ class Discriminator(nn.Module):
         image_size = pair(image_size)
         min_image_resolution = min(image_size)
 
-        num_layers = int(math.log2(min_image_resolution) - 2)
+        num_layers = 2 #int(math.log2(min_image_resolution) - 2)
         attn_res_layers = cast_tuple(attn_res_layers, num_layers)
 
         blocks = []
@@ -206,7 +200,7 @@ class Discriminator(nn.Module):
                                    for i in range(num_layers + 1)]
         layer_dims = [min(layer_dim, max_dim) for layer_dim in layer_dims]
         layer_dims_in_out = tuple(zip(layer_dims[:-1], layer_dims[1:]))
-
+    
         blocks = []
         attn_blocks = []
 
@@ -387,8 +381,7 @@ class CViViT(nn.Module):
 
         self.temporal_patch_size = temporal_patch_size
 
-        self.spatial_rel_pos_bias = ContinuousPositionBias(
-            dim=dim, heads=heads)
+        self.spatial_rel_pos_bias = ContinuousPositionBias(dim=dim, heads=heads)
 
         image_height, image_width = self.image_size
         assert (image_height % patch_height) == 0 and (
@@ -499,7 +492,7 @@ class CViViT(nn.Module):
         # === Optional Discriminator (GAN) Losses ===
         if self.gen_loss_w > 0 and use_discr:
             self.discr = Discriminator(
-                image_size=(64, 64),
+                image_size=self.image_size,
                 dim=discr_base_dim,
                 channels=channels,
                 attn_res_layers=discr_attn_res_layers
@@ -638,6 +631,33 @@ class CViViT(nn.Module):
         missing_keys, unexpected_keys = self.load_state_dict(pt, strict=False)
         self.load_state_dict(pt)
     
+    @classmethod
+    def from_pretrained(cls, model_dir, for_eval=True):
+        model_dir = Path(model_dir)
+        config_path = model_dir / "model_config.json"
+        weights_path = model_dir / "pytorch_model.bin"
+
+        # Load config
+        assert config_path.exists(), f"Missing config at {config_path}"
+        
+        import inspect
+        
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            valid_keys = inspect.signature(cls).parameters.keys()
+            filtered_config = {k: v for k, v in config.items() if k in valid_keys}
+            print("Loaded config:", filtered_config)
+
+        # Reconstruct model with loaded config
+        model = cls(**filtered_config)
+
+        model.load_state_dict(torch.load(weights_path, map_location='cpu'))
+
+        # Optional: strip off VGG, I3D, Discriminator if just evaluating
+        if for_eval:
+            model = model.copy_for_eval()
+
+        return model
     
     def decode_from_codebook_indices(self, indices):
         codes = self.vq.codebook[indices]
@@ -834,10 +854,10 @@ class CViViT(nn.Module):
         if return_discr_loss:
             assert exists(self.discr), 'discriminator must exist to train it'
             
-            video_frame_cropped = center_crop_64(video_frame).requires_grad_()
-            recon_frame_cropped = center_crop_64(recon_frame).detach()
+            video_frame_discr = video_frame.requires_grad_()
+            recon_frame_discr = recon_frame.detach()
 
-            recon_video_discr_logits, video_discr_logits = map(self.discr, (recon_frame_cropped, video_frame_cropped))
+            recon_video_discr_logits, video_discr_logits = map(self.discr, (recon_frame_discr, video_frame_discr))
             
             if torch.isinf(recon_video_discr_logits).any() or torch.isnan(recon_video_discr_logits).any():
                 print("⚠️  Discriminator path - fake logits:", recon_video_discr_logits.min().item(), recon_video_discr_logits.max().item())
@@ -848,7 +868,7 @@ class CViViT(nn.Module):
             discr_loss = self.discr_loss(recon_video_discr_logits, video_discr_logits)
 
             if apply_grad_penalty:
-                gp = gradient_penalty(video_frame_cropped, video_discr_logits)
+                gp = gradient_penalty(video_frame_discr, video_discr_logits)
                 loss = discr_loss + gp
             else:
                 loss = discr_loss
@@ -882,9 +902,9 @@ class CViViT(nn.Module):
             i3d_video_perceptual_loss = torch.tensor(0., device=video.device)
 
         # === Generator (GAN) loss ===
-        if self.gen_loss_w > 0 and self.discr is not None and current_step is not None and current_step > 30000:
-            discr_input = center_crop_64(recon_frame)
-            fake_logits = self.discr(discr_input)
+        if self.gen_loss_w > 0 and self.discr is not None and current_step is not None and current_step >= 0:
+            # discr_input = center_crop_64(recon_frame)
+            fake_logits = self.discr(recon_frame)
             
             if torch.isinf(fake_logits).any() or torch.isnan(fake_logits).any():
                 print("⚠️  Generator path - bad logits:", fake_logits.min().item(), fake_logits.max().item())
@@ -895,17 +915,19 @@ class CViViT(nn.Module):
 
         # calculate adaptive weight
 
-        # last_dec_layer = self.to_pixels[0].weight
+        last_dec_layer = self.to_pixels[0].weight
 
-        # norm_grad_wrt_gen_loss = grad_layer_wrt_loss(gen_loss, last_dec_layer).norm(p = 2)
-        # norm_grad_wrt_perceptual_loss = grad_layer_wrt_loss(perceptual_loss, last_dec_layer).norm(p = 2)
+        norm_grad_wrt_gen_loss = grad_layer_wrt_loss(gen_loss, last_dec_layer).norm(p = 2)
+        norm_grad_wrt_perceptual_loss = grad_layer_wrt_loss(perceptual_loss, last_dec_layer).norm(p = 2)
 
-        # adaptive_weight = safe_div(norm_grad_wrt_perceptual_loss, norm_grad_wrt_gen_loss)
-        # adaptive_weight.clamp_(max = 1e4)
+        adaptive_weight = safe_div(norm_grad_wrt_perceptual_loss, norm_grad_wrt_gen_loss)
+        adaptive_weight.clamp_(max = 1e4)
+        
+        # print(adaptive_weight.item())
 
         loss = (
             self.commit_loss_w * commit_loss +
-            self.gen_loss_w * gen_loss +
+            self.gen_loss_w * adaptive_weight * gen_loss +
             self.perceptual_loss_w * perceptual_loss +
             self.i3d_loss_w * i3d_video_perceptual_loss +
             self.recon_loss_w * recon_loss
